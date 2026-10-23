@@ -7,14 +7,28 @@
 // 显示条件: 当前模型 ID 或 provider ID 含 deepseek
 // 显示位置: sidebar.content 顶部
 // 会话开销: 按每条 assistant/compaction 消息的 token 与 DeepSeek 官方单价估算
+// 今日开销: 读取 OpenCode session.stats，按北京时间当天和峰谷价估算
 
 import { Plugin } from "@opencode/plugin/tui"
 import { For, Show, createEffect, createMemo, createSignal } from "solid-js"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
-
-type Currency = "CNY" | "USD"
+import {
+  type Currency,
+  type StatsSnapshot,
+  calculateUsageCost,
+  ensureModel,
+  isEmptyUsage,
+  mergeStats,
+  normalizeStats,
+  peakWindows,
+  priceFor,
+  startOfBeijingDay,
+  subtractStats,
+  tokensCost,
+  toNumber,
+} from "./usage"
 
 type BalanceInfo = {
   currency?: string
@@ -52,52 +66,11 @@ type ProviderEntry = {
   raw: Record<string, any>
 }
 
-type Price = {
-  cacheHit: number
-  cacheMiss: number
-  output: number
-}
-
-type PriceSet = {
-  peak: Price
-  offPeak: Price
-}
-
 const DEFAULT_BALANCE_URL = "https://api.deepseek.com/user/balance"
 const REFRESH_MS = 5 * 60 * 1000
 const IDLE_THROTTLE_MS = 60 * 1000
 const REQUEST_TIMEOUT_MS = 10 * 1000
-
-// DeepSeek 官方单价，单位：每百万 token。峰谷价按北京时间计算。
-const PRICE_TABLE: Record<string, Record<Currency, PriceSet>> = {
-  "deepseek-flash": {
-    CNY: {
-      peak: { cacheHit: 0.04, cacheMiss: 2, output: 8 },
-      offPeak: { cacheHit: 0.02, cacheMiss: 1, output: 4 },
-    },
-    USD: {
-      peak: { cacheHit: 0.006, cacheMiss: 0.3, output: 1.2 },
-      offPeak: { cacheHit: 0.003, cacheMiss: 0.15, output: 0.6 },
-    },
-  },
-  "deepseek-v4-pro": {
-    CNY: {
-      peak: { cacheHit: 0.3, cacheMiss: 9, output: 27 },
-      offPeak: { cacheHit: 0.15, cacheMiss: 4.5, output: 13.5 },
-    },
-    USD: {
-      peak: { cacheHit: 0.044, cacheMiss: 1.32, output: 3.96 },
-      offPeak: { cacheHit: 0.022, cacheMiss: 0.66, output: 1.98 },
-    },
-  },
-}
-
-const MODEL_ALIASES: Record<string, string> = {
-  "deepseek-v4-flash": "deepseek-flash",
-  "deepseek-v4-flash-vision-exp": "deepseek-flash",
-  "deepseek-v4.1-flash": "deepseek-flash",
-  "deepseek-flash-1017": "deepseek-flash",
-}
+const STATS_TIMEZONE = "Asia/Shanghai"
 
 const MONEY_FORMATTER = new Intl.NumberFormat("en-US", {
   minimumFractionDigits: 2,
@@ -295,15 +268,6 @@ function resolveBalanceUrl(baseURL?: string): string {
   return DEFAULT_BALANCE_URL
 }
 
-function toNumber(value: unknown): number {
-  if (typeof value === "number") return Number.isFinite(value) ? value : 0
-  if (typeof value === "string") {
-    const parsed = Number(value.replace(/,/g, ""))
-    return Number.isFinite(parsed) ? parsed : 0
-  }
-  return 0
-}
-
 async function fetchBalance(apiKey: string, url: string): Promise<BalanceState> {
   const response = await fetch(url, {
     headers: {
@@ -351,41 +315,6 @@ function formatTime(ms: number): string {
   const hours = String(date.getHours()).padStart(2, "0")
   const minutes = String(date.getMinutes()).padStart(2, "0")
   return `${hours}:${minutes}`
-}
-
-// 判断消息创建时间是否处于 DeepSeek 高峰时段（北京时间工作日 09-12、14-18）。
-function isPeak(ms: number): boolean {
-  const date = new Date(ms + 8 * 60 * 60 * 1000)
-  const day = date.getUTCDay()
-  if (day === 0 || day === 6) return false
-
-  const hour = date.getUTCHours()
-  return (hour >= 9 && hour < 12) || (hour >= 14 && hour < 18)
-}
-
-function priceFor(modelID: string | undefined, currency: Currency, at: number): Price | undefined {
-  if (!modelID) return undefined
-  const key = MODEL_ALIASES[modelID] ?? modelID
-  const prices = PRICE_TABLE[key]
-  if (!prices) return undefined
-
-  const set = prices[currency]
-  return isPeak(at) ? set.peak : set.offPeak
-}
-
-function tokensCost(tokens: any, price: Price): number {
-  const input = Math.max(0, toNumber(tokens?.input))
-  const output = Math.max(0, toNumber(tokens?.output) + toNumber(tokens?.reasoning))
-  const cacheRead = Math.max(0, toNumber(tokens?.cache?.read))
-  const cacheWrite = Math.max(0, toNumber(tokens?.cache?.write))
-
-  return (
-    (input * price.cacheMiss +
-      output * price.output +
-      cacheRead * price.cacheHit +
-      cacheWrite * 0) /
-    1_000_000
-  )
 }
 
 // 按消息逐条估算当前会话费用，避免会话中途切换模型时把 token 混在一起。
@@ -436,6 +365,87 @@ function estimateSessionCost(
   } catch {
     return undefined
   }
+}
+
+// 调用 OpenCode 的 stats 接口，按时间范围读取本地会话 token。
+async function fetchStats(context: any, from: number, to: number): Promise<StatsSnapshot> {
+  const session = context?.client?.session
+  if (typeof session?.stats !== "function") {
+    throw new Error("session.stats 不可用")
+  }
+
+  const response = await session.stats({
+    from,
+    to,
+    timezone: STATS_TIMEZONE,
+    tools: "none",
+  })
+
+  if (response && typeof response === "object" && "error" in response && response.error) {
+    throw new Error(String(response.error?.message ?? response.error))
+  }
+
+  const data =
+    response && typeof response === "object" && "data" in response ? response.data : response
+  if (!data || typeof data !== "object") {
+    throw new Error("session.stats 返回异常")
+  }
+
+  return normalizeStats(data)
+}
+
+// 找出与当前 API Key 相同的 provider，避免把另一个 DeepSeek 账号的用量算进来。
+function providerIDsForAccount(context: any, model: any, apiKey?: string): Set<string> {
+  const ids = new Set<string>()
+  if (model?.providerID) ids.add(String(model.providerID))
+  if (!apiKey) return ids
+
+  for (const file of configFiles(context?.location?.directory)) {
+    const config = readJsonc(file)
+    if (!config) continue
+
+    for (const entry of providerEntries(config)) {
+      const key = resolveApiKeyValue(entry.options.apiKey ?? entry.raw.apiKey)
+      if (key === apiKey) ids.add(entry.id)
+    }
+  }
+
+  return ids
+}
+
+// 估算当前 DeepSeek 账号今日的用量费用。峰值窗口单独查询，再用全天数据相减得到谷值。
+async function fetchTodayUsage(
+  context: any,
+  model: any,
+  currency: Currency,
+): Promise<number | undefined> {
+  const provider = resolveProviderConfig(context, model)
+  if (!provider.apiKey) return undefined
+
+  const now = Date.now()
+  const dayStart = startOfBeijingDay(now)
+  const providerIDs = providerIDsForAccount(context, model, provider.apiKey)
+
+  const all = ensureModel(
+    await fetchStats(context, dayStart, now),
+    model?.providerID,
+    model?.modelID,
+  )
+
+  if (all.models.length === 0 && isEmptyUsage(all.tokens)) return 0
+
+  const peak = mergeStats(
+    await Promise.all(
+      peakWindows(dayStart, now).map(([from, to]) =>
+        fetchStats(context, from, to).then((snapshot) =>
+          ensureModel(snapshot, model?.providerID, model?.modelID),
+        ),
+      ),
+    ),
+  )
+  const offPeak = subtractStats(all, peak)
+
+  return calculateUsageCost(peak, offPeak, currency, providerIDs)
 }
 
 function isDeepSeekModel(model: any): boolean {
@@ -514,6 +524,7 @@ function BalanceRow(props: {
 function BalanceCard(props: {
   sessionID: string
   balance: BalanceState | null
+  todayCost: number | undefined
   error: string | null
   refreshing: boolean
   context: any
@@ -597,6 +608,15 @@ function BalanceCard(props: {
             />
           </Show>
 
+          <Show when={props.todayCost !== undefined}>
+            <BalanceRow
+              label="今日约"
+              value={formatEstimate(currency(), props.todayCost ?? 0)}
+              labelColor={text.muted}
+              valueColor={text.muted}
+            />
+          </Show>
+
           <Show when={props.error}>
             <text fg={text.feedback?.error?.base ?? text.muted} truncate>
               刷新失败：{props.error}
@@ -619,10 +639,12 @@ export default Plugin.define({
   id: "deepseek.balance",
   async setup(context: any) {
     const [balance, setBalance] = createSignal<BalanceState | null>(null)
+    const [todayCost, setTodayCost] = createSignal<number | undefined>(undefined)
     const [error, setError] = createSignal<string | null>(null)
     const [refreshing, setRefreshing] = createSignal(false)
 
     let inFlight = false
+    let usageInFlight = false
     let lastAttemptAt = 0
     let lastSuccessAt = 0
     let lastProviderID: string | undefined
@@ -664,6 +686,30 @@ export default Plugin.define({
       }
     }
 
+    async function refreshUsage(): Promise<void> {
+      if (usageInFlight) return
+      if (!isDeepSeek()) return
+
+      const primary = balance()?.infos[0]
+      if (!primary) return
+
+      usageInFlight = true
+      try {
+        const cost = await fetchTodayUsage(context, currentModel(), primary.currency)
+        setTodayCost(cost)
+      } catch {
+        setTodayCost(undefined)
+      } finally {
+        usageInFlight = false
+      }
+    }
+
+    async function refreshAll(force = false): Promise<boolean> {
+      const ok = await refresh(force)
+      if (ok || balance()) await refreshUsage()
+      return ok
+    }
+
     // 首次进入以及切换到 DeepSeek 模型时按需加载，不阻塞插件 setup。
     createEffect(() => {
       const model = currentModel()
@@ -673,19 +719,19 @@ export default Plugin.define({
         lastProviderID !== model?.providerID ||
         Date.now() - lastSuccessAt >= REFRESH_MS
       ) {
-        void refresh()
+        void refreshAll()
       }
     })
 
     const refreshTimer = setInterval(() => {
-      if (isDeepSeek()) void refresh()
+      if (isDeepSeek()) void refreshAll()
     }, REFRESH_MS)
 
     // 每轮会话结束后刷新一次，60 秒内最多一次，避免频繁请求。
     const stopIdle = context.data.on("session.idle", () => {
       if (!isDeepSeek()) return
       if (Date.now() - lastAttemptAt < IDLE_THROTTLE_MS) return
-      void refresh()
+      void refreshAll()
     })
 
     context.keymap.layer(() => ({
@@ -707,7 +753,7 @@ export default Plugin.define({
               return
             }
 
-            const ok = await refresh(true)
+            const ok = await refreshAll(true)
             context.ui.toast.show({
               message: ok
                 ? "DeepSeek 余额已刷新"
@@ -726,6 +772,7 @@ export default Plugin.define({
           <BalanceCard
             sessionID={sessionID}
             balance={balance()}
+            todayCost={todayCost()}
             error={error()}
             refreshing={refreshing()}
             context={context}

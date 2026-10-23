@@ -1,6 +1,6 @@
 # opencode-deepseek-balance
 
-在 [OpenCode](https://opencode.ai) TUI 右侧侧边栏显示 DeepSeek 账户余额，并估算当前会话开销的插件。
+在 [OpenCode](https://opencode.ai) TUI 右侧侧边栏显示 DeepSeek 账户余额，并估算当前会话和当日开销的插件。
 
 ## 功能
 
@@ -8,6 +8,7 @@
 - 显示总余额、赠送余额、充值余额
 - 余额不足时给出提示
 - 按 token 用量和 DeepSeek 官方单价估算当前会话开销，标注“约”
+- 按 OpenCode 会话统计估算当日 DeepSeek 开销，标注“约”
 - 每 5 分钟自动刷新；每轮会话结束后刷新（60 秒内最多一次）
 - 命令面板“刷新 DeepSeek 余额”或 `/deepseek-balance` 手动刷新
 
@@ -19,6 +20,7 @@ DeepSeek 余额
 赠送    ¥10.00
 充值    ¥113.45
 本次约  ¥0.03
+今日约  ¥0.42
 更新    14:32
 ```
 
@@ -81,9 +83,9 @@ export DEEPSEEK_BASE_URL="https://your-proxy.example.com"
 export DEEPSEEK_BALANCE_URL="https://your-proxy.example.com/user/balance"
 ```
 
-## 会话开销说明
+## 会话与今日开销说明
 
-DeepSeek 开放平台只提供账户总余额接口，不提供按会话查询用量的接口，因此会话开销是根据本地消息 token 估算的：
+DeepSeek 开放平台只提供账户总余额接口，不提供按会话或按日查询用量的接口，因此 `本次约` 和 `今日约` 都是根据 OpenCode 本地记录估算的：
 
 ```text
 费用 = 非缓存输入 × 输入单价
@@ -93,10 +95,14 @@ DeepSeek 开放平台只提供账户总余额接口，不提供按会话查询�
 ```
 
 - 使用 DeepSeek 官方价格，内置 `deepseek-flash` 和 `deepseek-v4-pro`
-- 按每条消息的模型和时间戳计算，能处理会话中途切换模型
-- 高峰时段按北京时间工作日 09:00-12:00、14:00-18:00 判断
+- `本次约` 按当前会话每条消息的模型和时间戳计算，能处理会话中途切换模型
+- `今日约` 读取 OpenCode 的 `session.stats`，按消息创建时间统计北京时间当天、当前 DeepSeek 账号下所有项目的用量
+- 只统计 OpenCode 会话；其他客户端或脚本直接用同一 Key 的调用不计入
+- `今日约` 使用主余额币种计算；多币种账户只显示第一币种
+- 高峰时段按北京时间工作日 09:00-12:00、14:00-18:00 判断；当天谷值由“全天减去已开始的高峰窗口”得到
 - 中国法定节假日未单独处理，峰谷价和实际账单可能有差异
-- 未知模型不显示会话开销
+- 未知模型不计入费用；如果全部模型都不在价格表，`今日约` 不显示
+- 价格表需要随 DeepSeek 调价更新
 
 需要精确账单时，请以 DeepSeek 开放平台为准。
 
@@ -104,8 +110,8 @@ DeepSeek 开放平台只提供账户总余额接口，不提供按会话查询�
 
 | 命令 | 说明 |
 |---|---|
-| `/deepseek-balance` | 手动刷新余额 |
-| 命令面板“刷新 DeepSeek 余额” | 手动刷新余额 |
+| `/deepseek-balance` | 手动刷新余额和今日用量 |
+| 命令面板“刷新 DeepSeek 余额” | 手动刷新余额和今日用量 |
 
 ## 故障排查
 
@@ -116,15 +122,21 @@ DeepSeek 开放平台只提供账户总余额接口，不提供按会话查询�
 | `网络超时` / `网络错误` | 检查网络或代理；必要时设置 `DEEPSEEK_BALANCE_URL` |
 | 侧边栏没有内容 | 确认当前模型是 DeepSeek，且 `session.sidebar` 不是 `hide` |
 | 会话开销不显示 | 模型不在内置价格表，或当前会话还没有 token 用量 |
+| `今日约` 不显示 | 当天还没有 DeepSeek 用量、模型不在价格表，或当前 OpenCode 版本不提供 `session.stats` |
 
 ## 数据来源
+
+余额来自 DeepSeek 开放平台：
 
 ```http
 GET https://api.deepseek.com/user/balance
 Authorization: Bearer <DEEPSEEK_API_KEY>
 ```
 
+今日用量来自 OpenCode 的 `session.stats` 接口，不额外请求 DeepSeek 服务。
+
 ## 兼容性
 
 - OpenCode v2.0.32+
+- `今日约` 需要 OpenCode 提供 `session.stats`；旧版本会自动隐藏该行
 - 仅作用于 OpenCode TUI，不影响桌面端/Web 端
